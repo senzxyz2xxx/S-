@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import threading
@@ -22,9 +23,30 @@ WARN_LIMIT = int(os.getenv("WARN_LIMIT", "3"))
 WARN_MUTE_MINUTES = int(os.getenv("WARN_MUTE_MINUTES", "30"))
 
 # คำต้องห้าม (คั่นด้วยจุลภาค) เพิ่มเติมได้ผ่าน env BAD_WORDS โดยไม่ทับของเดิม
-DEFAULT_BAD_WORDS = ["อายุน้อยกว่า13", "พ่อมึง", "แม่มึง", "fuck", "bitch", "asshole"]
+DEFAULT_BAD_WORDS = ["พ่อมึง", "แม่มึง", "fuck", "bitch", "asshole"]
 EXTRA_BAD_WORDS = [w.strip().lower() for w in os.getenv("BAD_WORDS", "").split(",") if w.strip()]
 BAD_WORDS = set(w.lower() for w in DEFAULT_BAD_WORDS) | set(EXTRA_BAD_WORDS)
+
+# ---------- ตัวช่วยจับคำที่พยายามเลี่ยงตัวกรอง (เว้นวรรค / ตัวซ้ำ / leetspeak) ----------
+_LEET_MAP = str.maketrans({
+    "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t",
+    "@": "a", "$": "s", "!": "i",
+    # ตัวอักษรละตินหน้าตาคล้ายที่มักถูกใช้สลับ (Cyrillic look-alikes)
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i",
+})
+_SEPARATOR_RE = re.compile(r"[\s\.\-_\*\+~^`'\",:;|\\/]+")
+_REPEAT_RE = re.compile(r"(.)\1+")
+
+
+def normalize_text(text: str) -> str:
+    """ลดข้อความให้เหลือแก่นจริง: ตัดตัวคั่น, ยุบตัวอักษรซ้ำ, แปลง leetspeak"""
+    text = text.lower().translate(_LEET_MAP)
+    text = _SEPARATOR_RE.sub("", text)
+    text = _REPEAT_RE.sub(r"\1", text)
+    return text
+
+
+NORMALIZED_BAD_WORDS = {normalize_text(w) for w in BAD_WORDS if normalize_text(w)}
 
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "changeme123")
 SECRET_KEY = os.getenv("SECRET_KEY", "please-change-this-secret-key")
@@ -90,7 +112,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 user_messages = defaultdict(deque)   # timestamp ข้อความล่าสุด (กันสแปม)
 warnings = defaultdict(int)          # จำนวนคำเตือนสะสมต่อคน
@@ -107,12 +129,12 @@ UNMUTE_CONTACT_MSG = (
 async def mute_member(member: discord.Member, minutes: int, reason: str, moderator: str = "Auto") -> bool:
     try:
         await member.timeout(timedelta(minutes=minutes), reason=reason)
-    except discord.Forbidden:
+    except discord.HTTPException:
         return False
     modlog.add("MUTE", str(member), member.id, f"{reason} ({minutes} นาที)", moderator)
     try:
         await member.send(UNMUTE_CONTACT_MSG.format(guild=member.guild.name, reason=reason))
-    except discord.Forbidden:
+    except discord.HTTPException:
         pass
     return True
 
@@ -126,7 +148,7 @@ async def warn_user(member: discord.Member, reason: str, moderator: str = "Auto"
             f"คุณได้รับคำเตือนในเซิร์ฟเวอร์ **{member.guild.name}**\n"
             f"เหตุผล: {reason}\nจำนวนคำเตือนสะสม: {count}/{WARN_LIMIT}"
         )
-    except discord.Forbidden:
+    except discord.HTTPException:
         pass
     if count >= WARN_LIMIT:
         warnings[member.id] = 0
@@ -155,22 +177,30 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    content_lower = message.content.lower()
+    try:
+        await handle_moderation(message)
+    except Exception as e:
+        print(f"⚠️ on_message error: {e}")
+        modlog.add("ERROR", str(message.author), message.author.id, f"เกิดข้อผิดพลาดขณะตรวจข้อความ: {e}", "System")
 
-    # ---------- ระบบอัตโนมัติ 1: คำต้องห้าม ----------
-    if any(bad in content_lower for bad in BAD_WORDS):
+
+async def handle_moderation(message: discord.Message):
+    normalized_content = normalize_text(message.content)
+
+    # ---------- ระบบอัตโนมัติ 1: คำต้องห้าม (ตรวจแบบ normalize กันการเลี่ยงตัวกรอง) ----------
+    if any(bad in normalized_content for bad in NORMALIZED_BAD_WORDS):
+        modlog.add("BADWORD", str(message.author), message.author.id, "ใช้คำต้องห้าม", "Auto")
         try:
             await message.delete()
-        except discord.Forbidden:
+        except discord.HTTPException:
             pass
-        modlog.add("BADWORD", str(message.author), message.author.id, "ใช้คำต้องห้าม", "Auto")
         await warn_user(message.author, "ใช้คำต้องห้ามในข้อความ", "Auto")
         try:
             await message.channel.send(
                 f"🚫 ลบข้อความของ {message.author.mention} เนื่องจากมีคำต้องห้าม และแจ้งเตือนอัตโนมัติแล้ว",
                 delete_after=8,
             )
-        except discord.Forbidden:
+        except discord.HTTPException:
             pass
         return
 
@@ -183,20 +213,86 @@ async def on_message(message: discord.Message):
 
     if len(dq) > SPAM_MSG_LIMIT:
         dq.clear()
-        try:
-            await message.delete()
-        except discord.Forbidden:
-            pass
         modlog.add("SPAM", str(message.author), message.author.id, "ส่งข้อความรัวเกินกำหนด", "Auto")
-        muted = await mute_member(message.author, SPAM_MUTE_MINUTES, "ส่งข้อความสแปม", "Auto")
-        if muted:
-            await message.channel.send(
-                f"🔇 {message.author.mention} ถูกมิวท์ {SPAM_MUTE_MINUTES} นาที เนื่องจากส่งข้อความสแปม",
-                delete_after=10,
+
+        # เตือนก่อน (นับรวมกับคำเตือนทั่วไป) — ถ้าครบ WARN_LIMIT ฟังก์ชันนี้จะมิวท์ให้เองอัตโนมัติ
+        count = await warn_user(message.author, "ส่งข้อความสแปม", "Auto")
+
+        # ลบข้อความสแปมที่เพิ่งส่งมาทั้งหมดของคนนี้ในช่องนี้
+        try:
+            deleted = await message.channel.purge(
+                limit=SPAM_MSG_LIMIT + 5,
+                check=lambda m: m.author.id == message.author.id,
             )
+        except discord.HTTPException:
+            deleted = []
+
+        try:
+            if count < WARN_LIMIT:
+                await message.channel.send(
+                    f"⚠️ {message.author.mention} ได้รับคำเตือน ({count}/{WARN_LIMIT}) เนื่องจากส่งข้อความสแปม "
+                    f"— ลบข้อความไปแล้ว {len(deleted)} ข้อความ",
+                    delete_after=10,
+                )
+            else:
+                await message.channel.send(
+                    f"🔇 {message.author.mention} ถูกมิวท์ {SPAM_MUTE_MINUTES} นาที เนื่องจากสแปมจนครบคำเตือน "
+                    f"— ลบข้อความไปแล้ว {len(deleted)} ข้อความ",
+                    delete_after=10,
+                )
+        except discord.HTTPException:
+            pass
         return
 
     await bot.process_commands(message)
+
+
+# ================= COMMANDS: ช่วยเหลือ =================
+@bot.command(name="help")
+async def help_cmd(ctx):
+    embed = discord.Embed(
+        title="📖 คำสั่งบอทโมเดอเรเตอร์",
+        description=f"Prefix ของบอท: `{PREFIX}`",
+        color=discord.Color.from_rgb(79, 209, 197),
+    )
+    embed.add_field(
+        name="🤖 ระบบอัตโนมัติ (ทำงานเองไม่ต้องสั่ง)",
+        value=(
+            f"• กรองคำต้องห้าม → ลบข้อความ + เตือนอัตโนมัติ\n"
+            f"• กันสแปม (เกิน {SPAM_MSG_LIMIT} ข้อความใน {SPAM_TIME_WINDOW} วิ) → เตือน + ลบข้อความ\n"
+            f"• คำเตือนสะสมครบ {WARN_LIMIT}/{WARN_LIMIT} → มิวท์อัตโนมัติ {WARN_MUTE_MINUTES} นาที\n"
+            f"• ทุกครั้งที่ถูกมิวท์ จะได้รับ DM แจ้งให้ติดต่อเจ้าของบอทเพื่อขอปลดมิวท์"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ ระบบคำเตือน",
+        value=(
+            f"`{PREFIX}warn @user เหตุผล` — เตือนสมาชิกด้วยตนเอง\n"
+            f"`{PREFIX}warnings @user` — เช็คจำนวนคำเตือนสะสม\n"
+            f"`{PREFIX}clearwarn @user` — ล้างคำเตือนทั้งหมด"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔇 มิวท์ / ปลดมิวท์",
+        value=(
+            f"`{PREFIX}mute @user [นาที] [เหตุผล]` — มิวท์เอง (ไม่ระบุนาที = 10)\n"
+            f"`{PREFIX}unmute @user` — ปลดมิวท์"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ คำสั่งแอดมิน",
+        value=(
+            f"`{PREFIX}kick @user [เหตุผล]` — เตะออกจากเซิร์ฟเวอร์\n"
+            f"`{PREFIX}ban @user [เหตุผล]` — แบนถาวร\n"
+            f"`{PREFIX}clear [จำนวน]` — ลบข้อความในแชท (ไม่ระบุ = 10)"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="คำสั่งข้างต้นต้องมีสิทธิ์ Manage Messages หรือเป็นเจ้าของบอทถึงจะใช้ได้ (ยกเว้น help)")
+    await ctx.send(embed=embed)
 
 
 # ================= COMMANDS: ระบบคำเตือน (มือ, ไว้ใช้เสริมกรณีพิเศษ) =================
@@ -408,6 +504,7 @@ DASHBOARD_PAGE = """
   .tag-BAN{background:rgba(229,72,77,0.2); color:var(--red);}
   .tag-JOIN{background:rgba(79,209,197,0.15); color:var(--cyan);}
   .tag-CLEAR{background:rgba(127,149,139,0.15); color:var(--muted);}
+  .tag-ERROR{background:rgba(229,72,77,0.12); color:var(--red);}
   .detail{color:var(--text);}
   .who{color:var(--muted); text-align:right;}
   .empty{padding:40px; text-align:center; color:var(--muted); font-family:'IBM Plex Mono',monospace; font-size:13px;}
