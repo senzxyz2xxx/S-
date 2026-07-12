@@ -23,7 +23,7 @@ WARN_LIMIT = int(os.getenv("WARN_LIMIT", "3"))
 WARN_MUTE_MINUTES = int(os.getenv("WARN_MUTE_MINUTES", "30"))
 
 # คำต้องห้าม (คั่นด้วยจุลภาค) เพิ่มเติมได้ผ่าน env BAD_WORDS โดยไม่ทับของเดิม
-DEFAULT_BAD_WORDS = ["พ่อมึง", "แม่มึง", "fuck", "bitch", "asshole"]
+DEFAULT_BAD_WORDS = ["พ่อมึง", "แม่มึง", "bitch", "asshole"]
 EXTRA_BAD_WORDS = [w.strip().lower() for w in os.getenv("BAD_WORDS", "").split(",") if w.strip()]
 BAD_WORDS = set(w.lower() for w in DEFAULT_BAD_WORDS) | set(EXTRA_BAD_WORDS)
 
